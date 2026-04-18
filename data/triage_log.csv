@@ -15,3 +15,11 @@ TRG-1774498118,2026-03-26T09:38:38.488470,CRITICAL,FRAUD_ALERT,0.95,2.23,True,UR
 TRG-1774505457,2026-03-26T11:40:57.647685,CRITICAL,OVERDUE_PAYMENT_NOTICE,0.95,5.42,True,Subject: Overdue Payment Notice & Account Suspension Warning — Invoice INV-2026-
 TRG-1774528611,2026-03-26T18:06:51.945864,HIGH,INFORMATION_REQUEST,0.95,2.82,False,"Dear Finance Team, As part of our annual SOX compliance audit, we require certif"
 TRG-1774528686,2026-03-26T18:08:06.819588,CRITICAL,DISPUTE_RESOLTION,0.95,2.21,True,"We have a serious issue with Invoice INV-20240315 for $87,500. Our payment was t"
+TRG-1774586443,2026-03-27T10:10:43.468167,LOW,INQUIRY,0.8,2.7,False,"Hi, could you clarify the breakdown on invoice INV-2024-0892? I see a line item "
+TRG-1774591366,2026-03-27T11:32:46.385042,CRITICAL,FRAUD_ALERT,0.95,2.26,True,"Dear Taxpayer,
+Our records indicate that you are eligible to receive a tax refun"
+TRG-1774593245,2026-03-27T12:04:05.762831,CRITICAL,DISPUTE_RESOLUTION,0.95,3.05,True,"We have a serious issue with Invoice INV-20240315 for $87,500. Our payment was t"
+TRG-1774593831,2026-03-27T12:13:51.324202,CRITICAL,FRAUD_ALERT,0.95,2.83,True,"Subject: URGENT - Fraudulent Transactions Detected on Corporate Account
+
+Dear Fi"
+TRG-1776353598,2026-04-16T21:03:18.160223,CRITICAL,FRAUD_ALERT,0.95,3.3,True,URGENT: I noticed unauthorized transactions on my account ACC-849302 totaling $1
