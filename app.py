@@ -450,7 +450,7 @@ if "Triage Center" in page:
                         # create a second Streamlit tab.
                         st.markdown(
                             f"""
-                            <a href="{auth_url}" target="_top"
+                            <a href="{auth_url}" target="_blank"
                                style="
                                    display:flex;
                                    align-items:center;
