@@ -22,7 +22,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+#auth_url
 # ─── Advanced CSS Styling (Framer/Modern Aesthetic) ──────────────────────────
 st.markdown("""
 <style>
@@ -450,7 +450,7 @@ if "Triage Center" in page:
                         # create a second Streamlit tab.
                         st.markdown(
                             f"""
-                            <a href="{auth_url}" target="_self"
+                            <a href="{auth_url}" target="_top"
                                style="
                                    display:flex;
                                    align-items:center;
