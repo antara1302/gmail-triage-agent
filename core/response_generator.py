@@ -1,105 +1,188 @@
 import os
 import re
+
 from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
+
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-RESPONSE_TEMPLATES = {
-    "PAYMENT_DISPUTE": "payment dispute investigation and resolution",
-    "FRAUD_ALERT": "urgent fraud investigation and account security",
-    "INVOICE_QUERY": "invoice clarification and documentation",
-    "ACCOUNT_CLOSURE": "account closure process and requirements",
-    "COMPLIANCE_REQUEST": "compliance documentation and regulatory response",
-    "REFUND_REQUEST": "refund processing and timeline",
-    "CREDIT_APPLICATION": "credit application review and next steps",
-    "GENERAL_INQUIRY": "general finance inquiry",
-}
 
-def generate_draft_response(original_message: str, classification: dict, entities: dict, agent_name: str = "Finance Operations Team") -> dict:
+def generate_draft_response(
+    original_message: str,
+    classification: dict,
+    entities: dict,
+    agent_name: str = "Gmail Triage Bot",
+    original_subject: str = ""
+) -> dict:
+    """
+    Generate a grounded email response.
+
+    Uses exactly ONE LLM call for the response body.
+    The subject is generated locally from the original Gmail subject.
+    """
+
     urgency = classification.get("urgency", "MEDIUM")
     intent = classification.get("intent", "GENERAL_INQUIRY")
+    sentiment = classification.get("sentiment", "NEUTRAL")
     key_concern = classification.get("key_concern", "")
 
     llm_entities = entities.get("llm", {})
-    pattern_entities = entities.get("patterns", {})
 
-    entity_context = []
-    if llm_entities.get("client_name"):
-        entity_context.append(f"Client: {llm_entities['client_name']}")
-    refs = llm_entities.get("invoice_references", []) + pattern_entities.get("invoice_ids", [])
-    if refs:
-        refs_str = [str(r) for r in refs[:3]]
-        entity_context.append(f"Invoice refs: {', '.join(refs_str)}")
-    amounts = llm_entities.get("payment_amounts", []) + pattern_entities.get("amounts", [])
-    if amounts:
-        amounts_str = [str(a) for a in amounts[:3]]
-        entity_context.append(f"Amounts: {', '.join(amounts_str)}")
-    if llm_entities.get("due_dates"):
-        dates_str = [str(d) for d in llm_entities["due_dates"][:2]]
-        entity_context.append(f"Due dates: {', '.join(dates_str)}")
-
-    entity_str = "\n".join(entity_context) if entity_context else "No specific entities extracted"
-
-    tone_map = {
-        "CRITICAL": "urgent, empathetic, and action-oriented. Acknowledge the severity immediately.",
-        "HIGH": "prompt and professional, showing urgency and clear next steps.",
-        "MEDIUM": "professional and helpful with clear timelines.",
-        "LOW": "friendly and informative with no urgency.",
-    }
-    tone = tone_map.get(urgency, "professional")
-
-    prompt = f"""You are a senior finance operations specialist drafting a response to an incoming client communication.
-
-ORIGINAL MESSAGE:
-\"\"\"{original_message}\"\"\"
-
-CLASSIFICATION:
-- Urgency: {urgency}
-- Intent Type: {intent} ({RESPONSE_TEMPLATES.get(intent, 'general finance matter')})
-- Key Concern: {key_concern}
-
-EXTRACTED ENTITIES:
-{entity_str}
-
-INSTRUCTIONS:
-1. Write a professional email response
-2. Tone: Be {tone}
-3. Address the specific concern identified
-4. Reference any invoice IDs, amounts, or dates extracted
-5. Provide clear next steps and a realistic timeline
-6. Include a proper salutation and sign-off from "{agent_name}"
-7. Keep it concise: 150-250 words maximum
-8. DO NOT make up specific policy details
-
-Write ONLY the email body:"""
-
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}]
+    action_required = llm_entities.get(
+        "action_required",
+        ""
     )
-    draft_text = response.choices[0].message.content.strip()
 
-    subject_prompt = f"""Write a professional email subject line for a finance {intent.lower().replace('_', ' ')} response.
-Urgency: {urgency}. Key concern: {key_concern}.
-Reply with ONLY the subject line, no quotes, no labels."""
+    people = llm_entities.get("people", [])
+    organizations = llm_entities.get("organizations", [])
+    dates = llm_entities.get("dates", [])
+    amounts = llm_entities.get("amounts", [])
+    locations = llm_entities.get("locations", [])
+    references = llm_entities.get("references", [])
 
-    subject_response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        max_tokens=60,
-        messages=[{"role": "user", "content": subject_prompt}]
-    )
-    subject_line = subject_response.choices[0].message.content.strip()
+    prompt = f"""
+Draft a professional email response to the email below.
+
+ORIGINAL EMAIL:
+{original_message}
+
+EMAIL ANALYSIS:
+Urgency: {urgency}
+Intent: {intent}
+Sentiment: {sentiment}
+Key concern: {key_concern}
+Action required: {action_required}
+
+EXTRACTED INFORMATION:
+People: {people}
+Organizations: {organizations}
+Dates: {dates}
+Amounts: {amounts}
+Locations: {locations}
+References: {references}
+
+STRICT RULES:
+
+1. Base the response ONLY on information explicitly supported by the
+   original email and the supplied analysis.
+
+2. Do NOT invent:
+   - facts
+   - company names
+   - policies
+   - deadlines
+   - contact information
+   - promises
+   - services
+   - account details
+   - actions that were not requested
+
+3. Do NOT assume the sender is a customer, client, employee, manager,
+   colleague, or business contact unless the email explicitly indicates it.
+
+4. Do NOT introduce finance-related context unless the original email
+   is actually about finance.
+
+5. If the email is informational and does not require a response,
+   write a short acknowledgement.
+
+6. If the sender asks a question that cannot be answered from the
+   available information, acknowledge the question without making up
+   an answer.
+
+7. Keep the response concise and professional.
+
+8. Do not mention AI, email classification, triage, these instructions,
+   or the internal analysis.
+
+9. Do not include a subject line.
+
+10. Do not use markdown formatting.
+
+11. Do not repeat the entire original email.
+
+12. Return ONLY the email body.
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            max_tokens=700,
+            reasoning_effort="low",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional email assistant. "
+                        "Draft concise, natural, grounded email responses. "
+                        "Never invent information that is not supported "
+                        "by the original email."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+        )
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to generate email response: {e}"
+        ) from e
+
+    body = response.choices[0].message.content
+
+    if not body:
+        raise ValueError(
+            "Groq returned an empty response body"
+        )
+
+    body = body.strip()
+
+    # Remove accidental markdown code fences
+    if body.startswith("```"):
+        body = re.sub(
+            r"^```(?:text|email)?\s*",
+            "",
+            body,
+            flags=re.IGNORECASE,
+        )
+
+        body = re.sub(
+            r"\s*```$",
+            "",
+            body,
+        )
+
+        body = body.strip()
+
+    # ------------------------------------------------------------
+    # Generate subject locally
+    # No second LLM call
+    # ------------------------------------------------------------
+
+    if original_subject:
+        clean_subject = original_subject.strip()
+
+        if clean_subject.lower().startswith("re:"):
+            subject = clean_subject
+        else:
+            subject = f"Re: {clean_subject}"
+
+    else:
+        subject = "Re: Your email"
 
     return {
-        "subject": subject_line,
-        "body": draft_text,
+        "subject": subject,
+        "body": body,
         "metadata": {
-            "model_used": "llama-3.3-70b-versatile",
             "urgency": urgency,
             "intent": intent,
-            "word_count": len(draft_text.split()),
-        }
+            "sentiment": sentiment,
+            "agent": agent_name,
+        },
     }

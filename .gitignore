@@ -1,2 +1,7 @@
 venv/
 .env
+credentials.json
+token.json
+web_credentials.json
+__pycache__/
+*.py[cod]

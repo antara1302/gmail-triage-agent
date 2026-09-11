@@ -3,15 +3,21 @@ import streamlit as st
 import json
 import pandas as pd
 import plotly.express as px
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from datetime import datetime
 import os
 import csv
+import base64
+import hashlib
+import hmac
+import secrets
+import time
 from pathlib import Path
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="FinOps | Triage Agent",
+    page_title="Gmail Triage Bot",
     page_icon="💠",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -209,6 +215,147 @@ if "current_result" not in st.session_state:
     st.session_state.current_result = None
 if "edited_response" not in st.session_state:
     st.session_state.edited_response = ""
+if "gmail_email" not in st.session_state:
+    st.session_state.gmail_email = None
+if "gmail_emails" not in st.session_state:
+    st.session_state.gmail_emails = []
+if "manual_subject" not in st.session_state:
+    st.session_state.manual_subject = ""
+if "gmail_credentials" not in st.session_state:
+    st.session_state.gmail_credentials = None
+
+
+def get_redirect_uri():
+    """Return the OAuth callback URI used by this deployment."""
+    configured = os.getenv("GMAIL_REDIRECT_URI", "").strip()
+    if configured:
+        return configured.rstrip("/")
+
+    try:
+        host = st.context.headers.get("Host", "")
+        forwarded_proto = st.context.headers.get("X-Forwarded-Proto", "")
+    except Exception:
+        host = ""
+        forwarded_proto = ""
+
+    if not host:
+        return "http://localhost:8501"
+
+    if forwarded_proto:
+        scheme = forwarded_proto.split(",")[0].strip()
+    else:
+        scheme = "http" if host.startswith("localhost") or host.startswith("127.0.0.1") else "https"
+
+    return f"{scheme}://{host}"
+
+
+def _get_oauth_state_secret():
+    """Get a stable server-side secret for stateless OAuth state validation."""
+    configured = os.getenv("OAUTH_STATE_SECRET", "").strip()
+    if configured:
+        return configured.encode("utf-8")
+
+    # Local fallback: use the OAuth client secret already stored in the
+    # private web_credentials.json file. This keeps state validation working
+    # even when Streamlit creates a new session after Google's redirect.
+    try:
+        credentials_path = Path(__file__).resolve().parent / "web_credentials.json"
+        with open(credentials_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        client_secret = data.get("web", {}).get("client_secret", "")
+        if client_secret:
+            return client_secret.encode("utf-8")
+    except Exception:
+        pass
+
+    # Development-only fallback. Set OAUTH_STATE_SECRET in deployment.
+    return b"gmail-triage-development-state-secret"
+
+
+def create_oauth_state():
+    """Create a signed, stateless OAuth state value."""
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+    payload = f"{timestamp}.{nonce}"
+    signature = hmac.new(
+        _get_oauth_state_secret(),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def validate_oauth_state(state):
+    """Validate signed OAuth state without relying on Streamlit session state."""
+    if not state:
+        return False
+
+    try:
+        timestamp, nonce, signature = state.split(".", 2)
+        payload = f"{timestamp}.{nonce}"
+        expected = hmac.new(
+            _get_oauth_state_secret(),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, expected):
+            return False
+
+        # OAuth attempts older than 10 minutes are rejected.
+        return abs(int(time.time()) - int(timestamp)) <= 600
+    except (ValueError, TypeError):
+        return False
+
+
+def handle_google_oauth_callback():
+    """Handle Google's OAuth callback before rendering the main UI."""
+    code = st.query_params.get("code")
+    returned_state = st.query_params.get("state")
+    error = st.query_params.get("error")
+
+    if error:
+        st.error(f"Google OAuth Error: {error}")
+        st.query_params.clear()
+        return
+
+    if not code:
+        return
+
+    # Do not depend on st.session_state here. A Google redirect can create a
+    # new Streamlit session, which would otherwise lose the original state.
+    if not validate_oauth_state(returned_state):
+        st.error("OAuth security check failed. Please click Connect Gmail and try again.")
+        st.query_params.clear()
+        return
+
+    try:
+        from core.gmail_client import get_credentials_from_code, get_recent_emails
+
+        redirect_uri = get_redirect_uri()
+
+        with st.spinner("Connecting your Google account..."):
+            credentials = get_credentials_from_code(code, redirect_uri)
+
+        st.session_state.gmail_credentials = credentials
+
+        with st.spinner("Loading your 10 recent emails..."):
+            recent_emails = get_recent_emails(credentials, max_results=10)
+
+        st.session_state.gmail_emails = recent_emails
+        st.session_state.gmail_email = recent_emails[0] if recent_emails else None
+        st.session_state.current_result = None
+        st.session_state.edited_response = ""
+
+        st.query_params.clear()
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"Gmail connection failed: {str(e)}")
+        st.query_params.clear()
+
+
+handle_google_oauth_callback()
 
 # ─── Helper Functions (Logic preserved) ───────────────────────────────────────
 def get_urgency_badge_html(urgency: str) -> str:
@@ -230,10 +377,14 @@ def load_sample_messages():
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("<h2 style='letter-spacing:-1px;'>FinOps Agent</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='letter-spacing:-1px;'>Gmail Triage Bot</h2>", unsafe_allow_html=True)
     st.markdown("<div class='section-label'>Navigation</div>", unsafe_allow_html=True)
     
-    page = st.radio("", ["Triage Center", "Analytics", "History", "Settings"], label_visibility="collapsed")
+    page = st.radio(
+    "Navigation",
+    ["Triage Center", "Analytics", "History", "Settings"],
+    label_visibility="collapsed"
+    )
     
     st.markdown("---")
     st.markdown("<div class='section-label'>Session Activity</div>", unsafe_allow_html=True)
@@ -258,50 +409,275 @@ if "Triage Center" in page:
     st.markdown("<h1>Operational Triage</h1>", unsafe_allow_html=True)
     
     col_input, col_status = st.columns([2.5, 1])
-    
+
     with col_input:
-        samples = load_sample_messages()
-        sample_options = ["— paste your own message —"] + [s["label"] for s in samples]
-        selected_sample = st.selectbox("Select Template", sample_options)
-        
-        default_text = ""
-        if selected_sample != "— paste your own message —":
-            for s in samples:
-                if s["label"] == selected_sample:
-                    default_text = s["text"]; break
-        
-        message_input = st.text_area("Input Stream", value=default_text, height=200, placeholder="Awaiting finance communication data...", label_visibility="collapsed")
-        
-        btn_col, clear_col, _ = st.columns([1, 1, 2])
-        with btn_col:
-            run_btn = st.button("Generate Response", type="primary", use_container_width=True)
-        with clear_col:
-            if st.button("Clear Buffer", use_container_width=True):
-                st.session_state.current_result = None; st.rerun()
+        # --------------------------------------------------------
+        # Input Source
+        # Gmail is optional. Paste and sample modes require
+        # no Google authentication.
+        # --------------------------------------------------------
+        input_source = st.radio(
+            "Input Source",
+            ["Gmail", "Paste Email", "Sample Email"],
+            horizontal=True,
+        )
+
+        gmail_email = st.session_state.get("gmail_email")
+
+        if input_source == "Gmail":
+            st.markdown(
+                "<div style='color:#888; font-size:13px; margin-bottom:10px;'>"
+                "Connect your Gmail account to select an email from your recent inbox."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+            gmail_col, clear_col = st.columns([1, 1])
+
+            with gmail_col:
+                if not st.session_state.get("gmail_credentials"):
+                    try:
+                        from core.gmail_client import get_authorization_url
+
+                        redirect_uri = get_redirect_uri()
+                        oauth_state = create_oauth_state()
+                        auth_url, _ = get_authorization_url(
+                            redirect_uri,
+                            state=oauth_state,
+                        )
+
+                        # Navigate in the same browser tab so OAuth does not
+                        # create a second Streamlit tab.
+                        st.markdown(
+                            f"""
+                            <a href="{auth_url}" target="_self"
+                               style="
+                                   display:flex;
+                                   align-items:center;
+                                   justify-content:center;
+                                   width:100%;
+                                   box-sizing:border-box;
+                                   background:#0070F3;
+                                   color:white;
+                                   text-decoration:none;
+                                   border-radius:100px;
+                                   padding:10px 24px;
+                                   font-weight:600;
+                                   margin-top:4px;
+                               ">
+                                Connect Gmail
+                            </a>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    except Exception as e:
+                        st.error(f"OAuth setup error: {str(e)}")
+                else:
+                    st.success("✅ Gmail connected")
+
+            with clear_col:
+                if st.button("Clear Buffer", use_container_width=True):
+                    st.session_state.current_result = None
+                    st.session_state.gmail_email = None
+                    st.session_state.gmail_emails = []
+                    st.session_state.edited_response = ""
+                    st.rerun()
+
+            gmail_emails = st.session_state.get("gmail_emails", [])
+
+            if gmail_emails:
+                def email_label(email):
+                    sender = email.get("sender", "Unknown sender")
+                    subject = email.get("subject", "(No subject)").strip()
+                    return f"{subject}  —  {sender}"
+
+                selected_index = st.selectbox(
+                    "Select Email",
+                    range(len(gmail_emails)),
+                    format_func=lambda i: email_label(gmail_emails[i]),
+                )
+
+                selected_email = gmail_emails[selected_index]
+                st.session_state.gmail_email = selected_email
+
+                st.markdown(
+                    f"""
+                    <div class='bento-card' style='margin-top:14px;'>
+                        <div class='section-label'>Selected Gmail</div>
+                        <div style='font-size:13px; color:#C8CDD8;'>
+                            <b>From:</b> {selected_email.get("sender", "—")}<br>
+                            <b>Subject:</b> {selected_email.get("subject", "—")}<br>
+                            <b>Date:</b> {selected_email.get("date", "—")}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                analyze_col, _ = st.columns([1, 3])
+                with analyze_col:
+                    analyze_gmail_btn = st.button(
+                        "Analyze Selected Email",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if analyze_gmail_btn:
+                    try:
+                        with st.spinner("Analyzing Gmail email..."):
+                            from core.triage_agent import run_triage
+
+                            result = run_triage(
+                                message_text=selected_email.get("body", ""),
+                                original_subject=selected_email.get("subject", ""),
+                                agent_name="Gmail Triage Agent",
+                            )
+
+                        st.session_state.current_result = result
+                        st.session_state.edited_response = result[
+                            "draft_response"
+                        ]["body"]
+                        st.session_state.triage_history.insert(0, result)
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Gmail Error: {str(e)}")
+
+                message_input = selected_email.get("body", "")
+                subject_input = selected_email.get("subject", "")
+            else:
+                message_input = ""
+                subject_input = ""
+                if st.session_state.get("gmail_credentials"):
+                    st.info("No inbox emails found.")
+
+            run_btn = False
+
+        else:
+            samples = load_sample_messages()
+
+            if input_source == "Paste Email":
+                selected_sample = "— paste your own message —"
+            else:
+                sample_options = (
+                    ["— paste your own message —"]
+                    + [s["label"] for s in samples]
+                )
+
+                selected_sample = st.selectbox(
+                    "Select Template",
+                    sample_options,
+                )
+
+            default_text = ""
+
+            if (
+                input_source == "Sample Email"
+                and selected_sample != "— paste your own message —"
+            ):
+                for s in samples:
+                    if s["label"] == selected_sample:
+                        default_text = s["text"]
+                        break
+
+            subject_input = st.text_input(
+                "Email Subject",
+                value=st.session_state.get("manual_subject", ""),
+                placeholder="Optional email subject",
+            )
+
+            message_input = st.text_area(
+                "Input Stream",
+                value=default_text,
+                height=200,
+                placeholder="Paste an email message here...",
+                label_visibility="collapsed",
+            )
+
+            btn_col, clear_col, _ = st.columns([1, 1, 2])
+
+            with btn_col:
+                run_btn = st.button(
+                    "Generate Response",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            with clear_col:
+                if st.button("Clear Buffer", use_container_width=True):
+                    st.session_state.current_result = None
+                    st.session_state.edited_response = ""
+                    st.session_state.manual_subject = ""
+                    st.rerun()
 
     with col_status:
-        st.markdown("<div class='bento-card' style='height: 100%;'>", unsafe_allow_html=True)
-        st.markdown("<div class='section-label'>Pipeline Status</div>", unsafe_allow_html=True)
-        steps = {"Classification": "classification", "Extraction": "ner", "Synthesis": "response"}
+        st.markdown(
+            "<div class='bento-card' style='height: 100%;'>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div class='section-label'>Pipeline Status</div>",
+            unsafe_allow_html=True,
+        )
+
+        steps = {
+            "Classification": "classification",
+            "Extraction": "ner",
+            "Synthesis": "response",
+        }
+
         for name, key in steps.items():
             status_icon = "⚪"
+
             if st.session_state.current_result:
-                pipe = st.session_state.current_result.get("pipeline", {})
-                status_icon = "🔷" if pipe.get(key, {}).get("status") == "success" else "⚪"
-            st.markdown(f"<div style='margin-bottom:12px; font-size:14px;'>{status_icon} {name}</div>", unsafe_allow_html=True)
+                pipe = st.session_state.current_result.get(
+                    "pipeline",
+                    {}
+                )
+
+                status_icon = (
+                    "🔷"
+                    if pipe.get(key, {}).get("status") == "success"
+                    else "⚪"
+                )
+
+            st.markdown(
+                f"<div style='margin-bottom:12px; font-size:14px;'>"
+                f"{status_icon} {name}</div>",
+                unsafe_allow_html=True,
+            )
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Logic Execution (Preserved)
+    # Logic Execution
     if run_btn and message_input.strip():
         with st.spinner("Decoding Signal..."):
             try:
                 from core.triage_agent import run_triage
-                result = run_triage(message_input.strip(), agent_name="FinOps Intelligence")
+
+                st.session_state.manual_subject = subject_input
+
+                result = run_triage(
+                    message_text=message_input.strip(),
+                    original_subject=subject_input.strip(),
+                    agent_name="Gmail Triage Agent",
+                )
+
                 st.session_state.current_result = result
-                st.session_state.edited_response = result["draft_response"]["body"]
-                st.session_state.triage_history.insert(0, result)
+                st.session_state.edited_response = result[
+                    "draft_response"
+                ]["body"]
+
+                st.session_state.triage_history.insert(
+                    0,
+                    result
+                )
+
                 st.rerun()
-            except Exception as e: st.error(f"Hardware Fault: {str(e)}")
+
+            except Exception as e:
+                st.error(f"Hardware Fault: {str(e)}")
+
 
     # Results Display
     if st.session_state.current_result:
@@ -326,7 +702,107 @@ if "Triage Center" in page:
         with tab_response:
             st.text_input("Subject Line", value=res.get("draft_response", {}).get("subject", ""))
             st.text_area("Response Body", value=st.session_state.edited_response, height=300)
-            if st.button("Copy to Clipboard"): st.toast("Synced to Clipboard")
+            response_text = res["draft_response"]["body"]
+
+            components.html(
+                f"""
+                <style>
+                    html, body {{
+                        margin: 0;
+                        padding: 0;
+                        background: #000000 !important;
+                        overflow: hidden;
+                    }}
+
+                    .copy-wrap {{
+                        display: flex;
+                        align-items: center;
+                        position: relative;
+                        height: 48px;
+                    }}
+
+                    .copy-btn {{
+                        padding: 9px 16px;
+                        border-radius: 7px;
+                        border: 1px solid #3a3a3a;
+                        background: #242424;
+                        color: #f5f5f5;
+                        font-size: 14px;
+                        font-weight: 500;
+                        cursor: pointer;
+                        transition: background 0.15s ease, border-color 0.15s ease;
+                    }}
+
+                    .copy-btn:hover {{
+                        background: #303030;
+                        border-color: #666;
+                    }}
+
+                    .copy-btn:active {{
+                        transform: translateY(1px);
+                    }}
+
+                    .toast {{
+                        display: none;
+                        position: absolute;
+                        left: 0;
+                        top: 2px;
+                        padding: 7px 11px;
+                        border-radius: 6px;
+                        background: #1f2937;
+                        border: 1px solid #374151;
+                        color: #f9fafb;
+                        font-size: 13px;
+                        box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+                        z-index: 10;
+                    }}
+                </style>
+
+                <textarea id="copyText" style="position:absolute; left:-9999px;">{response_text}</textarea>
+
+                <div class="copy-wrap">
+                    <button class="copy-btn" onclick="copyResponse()">
+                        📋 Copy to Clipboard
+                    </button>
+                    <div id="copyToast" class="toast">✓ Response copied!</div>
+                </div>
+
+                <script>
+                function showToast() {{
+                    const toast = document.getElementById("copyToast");
+                    toast.style.display = "block";
+                    setTimeout(() => {{
+                        toast.style.display = "none";
+                    }}, 1800);
+                }}
+
+                function copyResponse() {{
+                    const text = document.getElementById("copyText").value;
+
+                    if (navigator.clipboard && window.isSecureContext) {{
+                        navigator.clipboard.writeText(text).then(showToast).catch(fallbackCopy);
+                    }} else {{
+                        fallbackCopy();
+                    }}
+                }}
+
+                function fallbackCopy() {{
+                    const textarea = document.getElementById("copyText");
+                    textarea.focus();
+                    textarea.select();
+                    textarea.setSelectionRange(0, textarea.value.length);
+                    try {{
+                        document.execCommand("copy");
+                        showToast();
+                    }} catch (err) {{
+                        console.error("Copy failed", err);
+                    }}
+                    textarea.blur();
+                }}
+                </script>
+                """,
+                height=50,
+            )
 
         # with tab_entities:
         #     ner = res.get("pipeline", {}).get("ner", {}).get("data", {})
@@ -368,13 +844,13 @@ if "Triage Center" in page:
             llm = ner.get("llm", {})
 
             if llm:
-                safe_display("Client Name", llm.get("client_name"))
-                safe_display("Company", llm.get("company_name"))
+                safe_display("People", llm.get("people"))
+                safe_display("Organizations", llm.get("organizations"))
+                safe_display("Dates", llm.get("dates"))
+                safe_display("Amounts", llm.get("amounts"))
+                safe_display("Locations", llm.get("locations"))
+                safe_display("References", llm.get("references"))
                 safe_display("Action Required", llm.get("action_required"))
-                safe_display("Payment Amounts", llm.get("payment_amounts"))
-                safe_display("Invoice References", llm.get("invoice_references"))
-                safe_display("Banks", llm.get("mentioned_banks"))
-                safe_display("Due Dates", llm.get("due_dates"))
 
             st.markdown("---")
 
@@ -448,7 +924,7 @@ elif "History" in page:
                     f"**Processing time:** {proc}s",
                     unsafe_allow_html=True
                 )
-
+#copy to clipboard
                 # Draft body preview
                 body = draft.get("body", "")
                 if body:
@@ -496,10 +972,11 @@ elif "Settings" in page:
     st.markdown("""
     | Task | Model Used | Why |
     |------|-----------|-----|
-    | Classification | llama-3.3-70b-versatile | Fast structured output |
-    | NER Extraction | llama-3.3-70b-versatile | Speed priority |
-    | Response Generation | llama-3.3-70b-versatile | Quality response |
-    | Subject Line | llama-3.3-70b-versatile | Simple task |
+    | Classification + Semantic NER | openai/gpt-oss-120b | Structured triage + semantic extraction |
+    | spaCy Entity Extraction | en_core_web_sm | Local deterministic NLP |
+    | Regex Extraction | Local regex | Fast structured pattern matching |
+    | Response Generation | openai/gpt-oss-120b | Grounded response drafting |
+    | Subject Line | Local | Reuses the original email subject |
     """)
 
     st.markdown('<div class="section-header" style="margin-top:24px;">Clear Data</div>', unsafe_allow_html=True)
