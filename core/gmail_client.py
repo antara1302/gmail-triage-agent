@@ -1,6 +1,7 @@
 """Server-side Gmail Web OAuth client for gmail-triage-bot."""
 
 import base64
+import os
 from email.utils import parseaddr
 from pathlib import Path
 
@@ -11,26 +12,86 @@ from googleapiclient.discovery import build
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_CREDENTIALS_FILE = BASE_DIR / "web_credentials.json"
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+
+def _get_google_client_config() -> dict:
+    """
+    Get Google OAuth client credentials.
+
+    Local development:
+        Reads web_credentials.json.
+
+    Streamlit Cloud:
+        Reads GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET
+        from Streamlit Secrets.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Local development: use web_credentials.json
+    # ---------------------------------------------------------
+    if WEB_CREDENTIALS_FILE.exists():
+        import json
+
+        with open(WEB_CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        return config
+
+    # ---------------------------------------------------------
+    # 2. Streamlit Cloud: use Streamlit Secrets
+    # ---------------------------------------------------------
+    try:
+        import streamlit as st
+
+        client_id = st.secrets.get("GOOGLE_CLIENT_ID")
+        client_secret = st.secrets.get("GOOGLE_CLIENT_SECRET")
+
+    except Exception:
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        raise RuntimeError(
+            "Google OAuth credentials not found. "
+            "For local development, add web_credentials.json. "
+            "For Streamlit Cloud, configure GOOGLE_CLIENT_ID "
+            "and GOOGLE_CLIENT_SECRET in Secrets."
+        )
+
+    return {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": (
+                "https://www.googleapis.com/oauth2/v1/certs"
+            ),
+        }
+    }
 
 
 def create_oauth_flow(redirect_uri: str) -> Flow:
     """Create the Web OAuth flow with PKCE explicitly disabled."""
-    if not WEB_CREDENTIALS_FILE.exists():
-        raise FileNotFoundError(
-            f"Missing {WEB_CREDENTIALS_FILE.name} in the project root."
-        )
 
-    return Flow.from_client_secrets_file(
-        str(WEB_CREDENTIALS_FILE),
+    client_config = _get_google_client_config()
+
+    return Flow.from_client_config(
+        client_config,
         scopes=SCOPES,
         redirect_uri=redirect_uri,
         autogenerate_code_verifier=False,
     )
 
 
-def get_authorization_url(redirect_uri: str, state: str | None = None):
+def get_authorization_url(
+    redirect_uri: str,
+    state: str | None = None,
+):
     """Build Google's account-selection/consent URL."""
+
     flow = create_oauth_flow(redirect_uri)
 
     return flow.authorization_url(
@@ -47,29 +108,42 @@ def get_credentials_from_code(
     state: str | None = None,
 ) -> Credentials:
     """Exchange Google's authorization code for user credentials."""
+
     flow = create_oauth_flow(redirect_uri)
 
-    # PKCE is disabled on both authorization and callback flows, so Google
-    # will not require a code_verifier here.
+    # PKCE is disabled on both authorization and callback flows,
+    # so Google will not require a code_verifier here.
     flow.fetch_token(code=code)
+
     return flow.credentials
 
 
 def build_gmail_service(credentials: Credentials):
-    return build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    """Create an authenticated Gmail API client."""
+
+    return build(
+        "gmail",
+        "v1",
+        credentials=credentials,
+        cache_discovery=False,
+    )
 
 
 def extract_body(payload: dict) -> str:
+    """Recursively extract the best available email body."""
+
     if not payload:
         return ""
 
     body_data = payload.get("body", {}).get("data")
     mime_type = payload.get("mimeType", "")
 
+    # Direct plain-text body.
     if body_data and mime_type == "text/plain":
         try:
             return base64.urlsafe_b64decode(body_data).decode(
-                "utf-8", errors="replace"
+                "utf-8",
+                errors="replace",
             )
         except Exception:
             return ""
@@ -83,16 +157,18 @@ def extract_body(payload: dict) -> str:
             if text:
                 return text
 
-    # Then recursively inspect multipart sections.
+    # Recursively inspect multipart sections.
     for part in parts:
         text = extract_body(part)
         if text:
             return text
 
+    # Last-resort decoding.
     if body_data:
         try:
             return base64.urlsafe_b64decode(body_data).decode(
-                "utf-8", errors="replace"
+                "utf-8",
+                errors="replace",
             )
         except Exception:
             pass
@@ -101,6 +177,8 @@ def extract_body(payload: dict) -> str:
 
 
 def parse_email(message: dict) -> dict:
+    """Convert a Gmail API message into a simple dictionary."""
+
     payload = message.get("payload", {})
     headers = payload.get("headers", []) or []
 
@@ -110,6 +188,7 @@ def parse_email(message: dict) -> dict:
     }
 
     raw_sender = header_map.get("from", "Unknown sender")
+
     sender_name, sender_email = parseaddr(raw_sender)
 
     if sender_name and sender_email:
@@ -128,8 +207,12 @@ def parse_email(message: dict) -> dict:
     }
 
 
-def get_recent_emails(credentials: Credentials, max_results: int = 10):
+def get_recent_emails(
+    credentials: Credentials,
+    max_results: int = 10,
+):
     """Fetch up to max_results recent inbox emails for this Google user."""
+
     service = build_gmail_service(credentials)
 
     response = (
@@ -144,6 +227,7 @@ def get_recent_emails(credentials: Credentials, max_results: int = 10):
     )
 
     emails = []
+
     for ref in response.get("messages", []):
         message = (
             service.users()
@@ -155,11 +239,18 @@ def get_recent_emails(credentials: Credentials, max_results: int = 10):
             )
             .execute()
         )
+
         emails.append(parse_email(message))
 
     return emails
 
 
 def get_latest_email(credentials: Credentials):
-    emails = get_recent_emails(credentials, max_results=1)
+    """Fetch the latest inbox email."""
+
+    emails = get_recent_emails(
+        credentials,
+        max_results=1,
+    )
+
     return emails[0] if emails else None
